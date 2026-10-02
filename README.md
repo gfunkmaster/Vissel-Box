@@ -1,36 +1,216 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Vissel-Box
 
-## Getting Started
+**Anonym, end-to-end-krypterad visselblåsarkanal för svenska organisationer.**
+Rapporten krypteras i visselblåsarens webbläsare med organisationens publika PGP-nyckel. Servern lagrar bara chiffer – den kan aldrig läsa innehållet.
 
-First, run the development server:
+> **English TL;DR** — Vissel-Box is a zero-knowledge whistleblowing channel built for the Swedish Whistleblowing Act (2021:890). Reports are PGP-encrypted *in the whistleblower's browser* using the organisation's public key; the backend only ever stores ciphertext. Private keys are generated client-side and never uploaded. Includes strict upload validation, rate limiting, Postgres Row Level Security and a 24-month automated retention policy. Stack: Next.js 16, React 19, TypeScript, Clerk, Supabase, Upstash Redis, openpgp.js. The UI is in Swedish.
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+---
+
+## Problemet
+
+Lagen om skydd för personer som rapporterar om missförhållanden (2021:890) kräver en konfidentiell rapporteringskanal. Den svåra delen är inte formuläret – det är att kanalens operatör inte får kunna läsa rapporterna. En vanlig "krypterad databas" hjälper inte: den som har databasåtkomst har också nyckeln.
+
+Vissel-Box flyttar krypteringen till den enda plats där den kan vara hemlig: visselblåsarens egen webbläsare.
+
+## Hur det fungerar
+
+```
+Organisation (engångs):
+  /dashboard/setup
+    1. generateKeyPair()  ->  RSA-4096-nyckelpar genereras I WEBLÄSAREN
+    2. private-key.pem    ->  laddas ner till organisationens dator (lamnar aldrig klienten)
+    3. public_key         ->  det ENDA som sparas i tenants.public_key, status -> 'active'
+
+Visselblasare (varje rapport):
+  /submit/<slug>
+    4. hamtar organisationens publika nyckel
+    5. encryptReport()    ->  PGP-krypterar texten lokalt i webblasaren
+    6. submitReport()     ->  skickar ENDAST chiffer till servern:
+                              rate limit -> Zod-validering -> tenant-kontroll -> INSERT
+
+Organisation (lasa):
+  /dashboard/reports/<id>
+    7. hamtar chiffret (RLS: endast agaren)
+    8. decryptReport()    ->  dekrypterar lokalt med private-key.pem
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Klartexten finns bara på två ställen: i visselblåsarens webbläsare och i läsarens webbläsare. Servern ser den aldrig.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Struktur
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+```
+src/app/
+  submit/[slug]/       publik rapporteringssida (anonym, ingen inloggning)
+  dashboard/           kraver Clerk-inloggning
+    onboarding/        skapa tenant (foretag + slug)
+    setup/             nyckelgenerering - sker i webblasaren
+    reports/           inkorg + detaljvy + dekryptering
+    settings/          tenant-installningar
+  actions/
+    report.ts          submitReport, updateReportStatus, getReportCounts (server actions)
+    tenant.ts          getTenantBySlug, getCurrentTenant, createTenant,
+                       activateTenantWithPublicKey, updateTenant
+src/lib/
+  crypto/              generateKeyPair, downloadPrivateKey, encryptReport/File/Attachments,
+                       decryptReport/File/Attachments
+  security/            ratelimit.ts (Upstash), validation.ts (Zod)
+  supabase/            klient, server-klient, typer
+src/middleware.ts      GDPR-dataminimering + Clerk-skydd
+supabase/
+  schema.sql           tabeller, RLS-policies, index
+  gdpr_retention.sql   24-manaders retention via pg_cron
+scripts/
+  a11y-audit.ts        axe-core WCAG 2.1 A/AA-scan
+  contrast-check.ts    filtrerar ut kontrastfel
+```
 
-## Learn More
+## Datamodell
 
-To learn more about Next.js, take a look at the following resources:
+**`tenants`** – organisationen som tar emot rapporter.
+`id`, `name`, `slug` (unik, URL-segment), `contact_email`, `created_at`, `public_key` (nullable till dess att setup är klar), `owner_id` (Clerk-ID), `status` (`setup` | `active`).
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+**`reports`** – själva rapporten.
+`id`, `tenant_id`, `encrypted_content` (PGP-armored chiffer), `encrypted_attachments` (JSON med krypterade filer), `status` (`new` | `read` | `archived` | `closed`), `created_at`, `closed_at`.
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+**`gdpr_deletion_log`** – revisionsspår för retentionen: `deleted_at`, `report_count`, `retention_months`, `notes`.
 
-## Deploy on Vercel
+Det finns **ingen kolumn för privat nyckel** i schemat – den existerar bara som en nedladdad fil hos organisationen.
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+### Row Level Security
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+| Tabell | Operation | Policy |
+|---|---|---|
+| `tenants` | SELECT | `true` – publik, eftersom den publika nyckeln måste kunna hämtas av en anonym besökare |
+| `tenants` | INSERT / UPDATE | `auth.uid()::text = owner_id` |
+| `reports` | INSERT | `true` – anonym inlämning är hela poängen |
+| `reports` | SELECT / UPDATE | endast tenantens `owner_id` |
+
+Den publika läsrätten på `tenants` är avsiktlig och ofarlig: den avslöjar namn, slug och publik nyckel – aldrig någon rapport och aldrig en privat nyckel.
+
+## Hotmodell och försvar
+
+Målet är inte "krypterad i vila" utan två saker: servern kan inte läsa rapporterna, och den som kommer över databasen kan inte läsa dem.
+
+| Hot | Försvar | Kod |
+|---|---|---|
+| Servern läser rapporten | Klientkryptering – endast chiffer lagras | `src/lib/crypto/encrypt.ts` |
+| Läckt databas | Endast chiffer + publik nyckel finns där | `supabase/schema.sql` |
+| Läckt privat nyckel | Nyckeln finns aldrig på servern | `src/lib/crypto/keys.ts` |
+| Manipulerat chiffer (bit-flip, trunkering) | PGPs integritetsskydd – dekryptering misslyckas | `security.test.ts` |
+| Skräp eller klartext skickas in | Zod kräver `-----BEGIN PGP MESSAGE-----`, 100 B–5 MB | `validation.ts` |
+| Skadlig filuppladdning | MIME- och ändelse-allowlist, max 10 MB, dubbel ändelse | `validation.ts` |
+| Spam/DoS mot öppen endpoint | Upstash sliding window, 5/minut | `ratelimit.ts` |
+| SQL-injektion | Supabase parametriserade queries + Zod | `report.ts` |
+| Personuppgifter i metadata | Middleware strippar IP- och UA-headers på anonyma routes | `middleware.ts` |
+| Rapport hamnar hos fel tenant | Tenant måste finnas och ha `status = 'active'` | `report.ts` |
+| Känsliga data i cache/proxy | `cache-control: no-store, no-cache, must-revalidate, private` | `middleware.ts` |
+
+**Headers som strippas på anonyma routes** (`/submit/*`, `/:slug/report`, `/api/submit*`): `x-forwarded-for`, `x-real-ip`, `x-client-ip`, `cf-connecting-ip`, `true-client-ip`, `x-cluster-client-ip`, `forwarded`, `x-forwarded`, `x-vercel-ip`, `x-vercel-forwarded-for`. `user-agent` ersätts med `Anonymous-Client/1.0` och svaret märks med `x-gdpr-anonymized: true`.
+
+**Filuppladdning** tillåter bara `application/pdf`, `image/jpeg`, `image/png`, `image/gif`, `image/webp` med ändelserna `.pdf .jpg .jpeg .png .gif .webp`. Filnamn får inte innehålla `< > : " / \ | ? *` eller kontrolltecken, och dubbeländelser som `fil.pdf.exe` avvisas. Filen krypteras **innan** den lämnar webbläsaren.
+
+## GDPR och retention
+
+- **Dataminimering (art. 5(1)(c))** – `reports` saknar kolumner för IP, user-agent, enhet och e-post. Verifieras automatiskt av `src/__tests__/gdpr-audit.test.ts`.
+- **Lagringsbegränsning (art. 5(1)(e))** – rapporten avslutas med status `closed` + `closed_at`. Ett pg_cron-jobb kör `gdpr_delete_expired_reports()` dagligen 03:00 UTC och hårdraderar allt som varit stängt i mer än 24 månader. Körningen loggas i `gdpr_deletion_log` utan personuppgifter.
+- **Ingen cache** på anonyma routes, och ingen kaka krävs för att skicka en rapport.
+- **Medveten avvägning** – rate limitern är *fail-open*: är Redis nere släpps rapporten igenom och felet loggas. Hellre en legitim rapport än att blockera alla.
+- `contact_email` i `tenants` tillhör organisationens administratör, aldrig visselblåsaren.
+
+## Kom igång
+
+Krav: Node 20 eller senare (utvecklat mot Node 24) samt konton hos Supabase, Clerk och Upstash (Upstash har gratisnivå).
+
+```bash
+git clone https://github.com/gfunkmaster/Vissel-Box.git
+cd Vissel-Box
+npm install
+cp .env.example .env.local
+```
+
+Fyll i `.env.local`:
+
+| Variabel | Källa |
+|---|---|
+| `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Supabase → Project Settings → API |
+| `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`, `CLERK_SECRET_KEY` | Clerk → API Keys |
+| `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN` | Upstash → Redis-databas → REST |
+
+**Databas – kör i denna ordning i Supabase SQL Editor:**
+
+1. `supabase/schema.sql` – tabeller, RLS-policies, index
+2. `supabase/gdpr_retention.sql` – lägger till status `closed`, `closed_at` och cron-jobbet
+
+> Aktivera `pg_cron` först: Database → Extensions → `pg_cron`.
+>
+> Ordningen spelar roll. `schema.sql` tillåter `new/read/archived`, och `gdpr_retention.sql` ersätter den constrainten med `new/read/archived/closed`. Kör du bara den första får `closed` constraint-fel, och `updateReportStatus('closed')` i `report.ts` slutar fungera.
+
+```bash
+npm run dev     # http://localhost:3000
+npm run build   # produktionsbygge
+npm run lint    # eslint
+```
+
+**Onboarding (engångs per organisation):**
+
+1. `/sign-up` – skapa konto (Clerk)
+2. `/dashboard/onboarding` – företagsnamn, slug, kontaktmejl
+3. `/dashboard/setup` – generera nyckelpar. Den privata nyckeln laddas ner som `private-key.pem`, den publika sparas i databasen och tenanten sätts till `active`
+4. Rapporteringslänken blir `/submit/<slug>`
+
+> `private-key.pem` går inte att återskapa. Utan den kan ingen – inte heller du – läsa inkomna rapporter.
+
+## Test och kvalitetskontroll
+
+```bash
+npm test                # vitest: 21 tester i 2 filer (verifierat 2026-10-02)
+npx tsc --noEmit        # typkontroll (inget npm-skript finns för detta)
+npm run lint            # eslint
+```
+
+- `src/__tests__/security.test.ts` (10 tester) bevisar zero-knowledge-arkitekturen: att serverpayloaden aldrig innehåller klartext, att fel nyckel inte kan dekryptera, att manipulerat eller trunkerat chiffer upptäcks, och hela kedjan kryptera → lagra → hämta → dekryptera.
+- `src/__tests__/gdpr-audit.test.ts` (11 tester) dokumenterar och verifierar dataminimeringen: att `reports` saknar kolumner för IP, user-agent, enhet och e-post, och att `submitReport` bara tar emot `tenantId`, `encryptedContent` och `encryptedAttachments`.
+
+Tillgänglighet (kräver att dev-servern kör och att en tenant med slug `demo` finns):
+
+```bash
+npx playwright install chromium
+npx --yes tsx scripts/a11y-audit.ts       # axe-core, WCAG 2.1 A/AA
+npx --yes tsx scripts/contrast-check.ts   # listar kontrastfel
+```
+
+Skripten avslutar med exit-kod 1 när brott hittas och kan därför användas som CI-grind. `tsx` är inte en devDependency, därav `npx --yes` – lägg till `tsx` under `devDependencies` om du vill ha det reproducerbart.
+
+## Kända begränsningar
+
+Ärligt nuläge – detta återstår:
+
+1. **Rate limiting krockar med dataminimeringen.** Middleware strippar IP-headers på `/submit/*`, så `getClientIp()` faller tillbaka på `'unknown'`. Alla anonyma inlämningar delar därför en gemensam kvot på 5/minut i stället för en per IP. Storskalig spam stoppas fortfarande, men en enskild användare kan förbruka kvoten för alla. Tänkbar lösning: räkna på en saltad IP-hash som skapas i middleware och aldrig loggas.
+2. **Två av tre rate limiters anropas aldrig.** `tenantLookupLimiter` och `dashboardLimiter` är definierade i `ratelimit.ts` men används inte; `getTenantBySlug` går direkt mot databasen utan begränsning.
+3. **Fail-open vid Redis-avbrott.** Är Upstash otillgängligt försvinner spamskyddet helt. Avsiktligt val, men bör övervakas.
+4. **Ingen CI.** Inga GitHub Actions-workflows – tester, lint och a11y-scan körs bara manuellt.
+5. **Ingen nyckelrotation eller återställning.** Tappas `private-key.pem` är gamla rapporter oläsbara för alltid. Nyckeln laddas ner okrypterad, det finns ingen backup-väg och inget sätt att återkalla en nyckel.
+6. **Legacy-routes kvar.** `src/app/[slug]/page.tsx` och `src/app/[slug]/report/page.tsx` gör i stort sett samma sak som `/submit/[slug]` och bör konsolideras.
+7. **Bilagor lagras som base64-text i rapportraden** (upp till 50 MB per rapport). Objektlagring vore rimligare – nu växer tabellen och backupen snabbt.
+8. **WCAG är "byggt för", inte "granskat".** Formuläret har korrekt label-koppling, `aria-live` för statusmeddelanden, fokusflytt vid fel och `sr-only`-texter, och det finns ett axe-skript – men ingen dokumenterad granskningskörning och ingen grind i CI.
+9. **`alter table auth.users enable row level security`** i `schema.sql` är sannolikt överflödigt (RLS är redan aktiverat i Supabase) och kan ge rättighetsfel i SQL-editorn.
+10. **Ingen e-postnotifiering** när en rapport kommer in – organisationen måste själv titta i dashboarden. Det finns inga mailberoenden i `package.json`.
+
+## Teknikstack
+
+| Lager | Val |
+|---|---|
+| Ramverk | Next.js 16.1.6 (App Router, Server Actions), React 19.2.3 |
+| Språk | TypeScript 5 |
+| UI | Tailwind CSS 4, Radix UI / shadcn-komponenter, lucide-react |
+| Autentisering | Clerk 6.37 (`clerkMiddleware`, `auth.protect()`) |
+| Databas | Supabase Postgres med Row Level Security, `@supabase/ssr` |
+| Rate limiting | Upstash Redis + `@upstash/ratelimit` (sliding window) |
+| Kryptografi | openpgp.js 6.3 (RSA-4096, armored PGP) |
+| Validering | Zod 4.3 |
+| Test | Vitest 4.0.18; Playwright 1.58 + `@axe-core/playwright` för a11y |
+
+## Licens
+
+MIT – se [LICENSE](LICENSE).
