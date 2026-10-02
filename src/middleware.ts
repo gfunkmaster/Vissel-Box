@@ -1,33 +1,21 @@
 import { clerkMiddleware, createRouteMatcher } from '@clerk/nextjs/server'
 import { NextResponse } from 'next/server'
-import type { NextRequest } from 'next/server'
+import { anonymizeHeaders } from '@/lib/security/anonymize'
 
 /**
  * GDPR-COMPLIANT MIDDLEWARE
  * =========================
- * 
+ *
  * This middleware implements data minimization (GDPR Art. 5(1)(c)) by:
  * 1. Stripping identifying headers from anonymous report submissions
  * 2. Preventing IP address and user-agent from reaching server logic
- * 
+ * 3. Forwarding a salted IP hash so the rate limiter still works per client
+ *
  * IMPORTANT: This runs BEFORE the request reaches any Server Action or API route.
+ * The header logic lives in src/lib/security/anonymize.ts so it can be unit tested.
  */
 
-// Headers that could identify the whistleblower - MUST be stripped
-const SENSITIVE_HEADERS = [
-    'x-forwarded-for',       // Proxy chain IPs
-    'x-real-ip',             // Real client IP
-    'x-client-ip',           // Client IP
-    'cf-connecting-ip',      // Cloudflare client IP
-    'true-client-ip',        // Akamai/Cloudflare
-    'x-cluster-client-ip',   // Load balancer IP
-    'forwarded',             // Standard forwarding header
-    'x-forwarded',           // Legacy forwarding
-    'x-vercel-ip',           // Vercel IP header
-    'x-vercel-forwarded-for',// Vercel forwarding
-] as const
-
-// Routes where headers should be stripped (anonymous submission routes)
+// Routes where identifying headers are stripped (anonymous submission routes)
 const isAnonymousRoute = createRouteMatcher([
     '/submit/(.*)',          // Public submission form
     '/:slug/report',         // Legacy report route
@@ -39,44 +27,17 @@ const isProtectedRoute = createRouteMatcher([
     '/dashboard(.*)',
 ])
 
-/**
- * Strips sensitive headers from a request before it continues
- * This ensures no identifying information reaches our server logic
- */
-function stripSensitiveHeaders(request: NextRequest): Headers {
-    const sanitizedHeaders = new Headers(request.headers)
-
-    // Remove all identifying headers
-    for (const header of SENSITIVE_HEADERS) {
-        sanitizedHeaders.delete(header)
-    }
-
-    // Optionally anonymize user-agent (convert to generic)
-    // We don't delete it entirely as it may break some functionality
-    // Instead we replace with a generic value
-    sanitizedHeaders.set('user-agent', 'Anonymous-Client/1.0')
-
-    return sanitizedHeaders
-}
-
-/**
- * GDPR Log Suppression
- * Prevents accidental logging of sensitive data
- */
-function createSanitizedRequest(request: NextRequest): NextRequest {
-    // Note: Next.js doesn't allow modifying the request directly
-    // The header stripping is done in the response chain
-    return request
-}
-
 export default clerkMiddleware(async (auth, req) => {
     // For anonymous routes, strip identifying headers
     if (isAnonymousRoute(req)) {
-        // Create response with sanitized headers
+        // anonymizeHeaders() removes every IP header, replaces the user-agent and
+        // sets x-client-hash (HMAC-SHA256 of the IP + IP_HASH_SALT). A client
+        // supplied x-client-hash is always discarded.
+        const headers = await anonymizeHeaders(req.headers, process.env.IP_HASH_SALT)
+
         const response = NextResponse.next({
             request: {
-                // Pass through with note that this is anonymized
-                headers: stripSensitiveHeaders(req),
+                headers,
             },
         })
 

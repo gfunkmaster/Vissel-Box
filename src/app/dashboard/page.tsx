@@ -93,10 +93,10 @@ export default async function DashboardPage() {
                     <CardContent>
                         <div className="flex items-center gap-4">
                             <code className="flex-1 bg-slate-800 rounded-lg px-4 py-3 text-emerald-400 text-sm">
-                                {typeof window !== 'undefined' ? window.location.origin : 'https://vissel-box.se'}/{tenant.slug}
+                                /submit/{tenant.slug}
                             </code>
                             <Link
-                                href={`/${tenant.slug}`}
+                                href={`/submit/${tenant.slug}`}
                                 target="_blank"
                                 className="text-emerald-400 hover:text-emerald-300"
                             >

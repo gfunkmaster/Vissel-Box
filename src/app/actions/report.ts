@@ -7,8 +7,9 @@ import { headers } from 'next/headers'
 import type { Report, ReportStatus } from '@/lib/supabase/types'
 import {
     reportSubmitLimiter,
+    dashboardLimiter,
     checkRateLimit,
-    getClientIp,
+    getRateLimitIdentifier,
     ReportSubmissionSchema,
     validateInput,
 } from '@/lib/security'
@@ -35,13 +36,19 @@ export async function submitReport(data: {
     // 1. RATE LIMITING - Prevent spam attacks
     // ============================================
     const headersList = await headers()
-    const clientIp = getClientIp(headersList)
+
+    // Identifieraren är en saltad IP-hash som middleware räknat fram - aldrig en
+    // rå IP-adress. Ser vi ingen hash blir nyckeln 'unknown', dvs en gemensam
+    // kvot, vilket är säkrare än att råa IP-adresser hamnar i Redis.
+    const clientIdentifier = getRateLimitIdentifier(headersList)
 
     try {
-        const rateLimit = await checkRateLimit(reportSubmitLimiter, clientIp)
+        const rateLimit = await checkRateLimit(reportSubmitLimiter, clientIdentifier)
 
         if (!rateLimit.success) {
-            console.warn(`Rate limit exceeded for IP: ${clientIp}`)
+            // Logga aldrig identifieraren: den är pseudonym men behöver inte
+            // spridas i loggar. Det räcker att veta ATT gränsen nåddes.
+            console.warn('Rate limit exceeded for anonymous submission')
             return {
                 success: false,
                 error: `För många försök. Vänta ${Math.ceil((rateLimit.resetAt.getTime() - Date.now()) / 1000)} sekunder.`,
@@ -108,12 +115,37 @@ export async function submitReport(data: {
 }
 
 /**
+ * Skyddar dashboard-actions med en gräns per användare (100/min, se ratelimit.ts).
+ *
+ * Gränsen är per Clerk-användare, inte per IP: dashboarden kräver inloggning, så
+ * vi har en stabil identitet som inte behöver pseudonymiseras.
+ *
+ * Returnerar false när gränsen är nådd - anroparen svarar då med tomt/nekande i
+ * stället för att kasta. Är Redis nere failar checkRateLimit öppet (true), så ett
+ * Upstash-avbrott låser aldrig ute en legitim administratör.
+ */
+async function withinDashboardLimit(userId: string): Promise<boolean> {
+    const limit = await checkRateLimit(dashboardLimiter, `user:${userId}`)
+
+    if (!limit.success) {
+        console.warn('Dashboard rate limit reached for authenticated user')
+        return false
+    }
+
+    return true
+}
+
+/**
  * Get all reports for the current user's tenant
  */
 export async function getReportsForTenant(): Promise<Report[]> {
     const { userId } = await auth()
 
     if (!userId) {
+        return []
+    }
+
+    if (!(await withinDashboardLimit(userId))) {
         return []
     }
 
@@ -155,6 +187,10 @@ export async function getReportById(reportId: string): Promise<Report | null> {
         return null
     }
 
+    if (!(await withinDashboardLimit(userId))) {
+        return null
+    }
+
     const supabase = await createClient()
 
     const { data, error } = await supabase
@@ -181,6 +217,10 @@ export async function updateReportStatus(
 
     if (!userId) {
         return { success: false, error: 'Not authenticated' }
+    }
+
+    if (!(await withinDashboardLimit(userId))) {
+        return { success: false, error: 'För många förfrågningar. Försök igen om en stund.' }
     }
 
     const supabase = await createClient()
@@ -223,6 +263,10 @@ export async function getReportCounts(): Promise<{
     const { userId } = await auth()
 
     if (!userId) {
+        return { new: 0, read: 0, archived: 0, total: 0 }
+    }
+
+    if (!(await withinDashboardLimit(userId))) {
         return { new: 0, read: 0, archived: 0, total: 0 }
     }
 

@@ -100,25 +100,8 @@ export async function checkRateLimit(
 }
 
 /**
- * Extract client IP from headers (works with Vercel, Cloudflare, etc.)
- * Falls back to 'unknown' if no IP can be determined
+ * Identiteten för rate limiting hämtas ur `getRateLimitIdentifier()`
+ * (src/lib/security/anonymize.ts) - den läser den saltade IP-hash som
+ * middleware lägger till. Den råa IP-adressen finns inte längre tillgänglig
+ * här, och ska inte heller finnas i Redis-nycklarna.
  */
-export function getClientIp(headers: Headers): string {
-    // Check various headers in order of preference
-    const ipHeaders = [
-        'x-real-ip',
-        'x-forwarded-for',
-        'cf-connecting-ip',
-        'x-vercel-forwarded-for',
-    ]
-
-    for (const header of ipHeaders) {
-        const value = headers.get(header)
-        if (value) {
-            // x-forwarded-for can contain multiple IPs, take the first
-            return value.split(',')[0].trim()
-        }
-    }
-
-    return 'unknown'
-}

@@ -1,8 +1,13 @@
 -- Vissel-Box: Zero-Knowledge Whistleblower SaaS Schema
 -- Apply this to your Supabase project via SQL Editor
-
--- Enable Row Level Security
-alter table auth.users enable row level security;
+--
+-- This is the COMPLETE schema, including the 'closed' status and the closed_at
+-- column that the GDPR retention policy builds on. Run this first, then
+-- supabase/gdpr_retention.sql.
+--
+-- Note: row level security on auth.users is already enabled by Supabase and
+-- cannot be changed from the SQL editor (the postgres role does not own that
+-- table), so it is deliberately not touched here.
 
 -- 1. TENANTS (The Companies paying you)
 create table tenants (
@@ -22,8 +27,11 @@ create table reports (
   tenant_id uuid references tenants(id) not null,
   encrypted_content text not null, -- THE GIBBERISH BLOB
   encrypted_attachments text, -- OPTIONAL: File encryption
-  status text default 'new' check (status in ('new', 'read', 'archived')),
-  created_at timestamp with time zone default timezone('utc'::text, now()) not null
+  -- 'closed' = the investigation is finished. The GDPR retention job hard
+  -- deletes reports that have been closed for more than 24 months.
+  status text default 'new' check (status in ('new', 'read', 'archived', 'closed')),
+  created_at timestamp with time zone default timezone('utc'::text, now()) not null,
+  closed_at timestamp with time zone -- set when the status becomes 'closed'
 );
 
 -- Enable RLS on tables
@@ -72,3 +80,5 @@ create index idx_tenants_owner on tenants(owner_id);
 create index idx_reports_tenant on reports(tenant_id);
 create index idx_reports_status on reports(status);
 create index idx_reports_created on reports(created_at desc);
+-- Partial index for the retention job: only closed reports are ever scanned there
+create index idx_reports_closed_at on reports(closed_at) where closed_at is not null;

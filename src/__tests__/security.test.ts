@@ -110,11 +110,9 @@ describe('Zero-Knowledge Security Tests', () => {
             await expect(async () => {
                 // This simulates what the server could attempt
                 const message = await openpgp.readMessage({ armoredMessage: serverData.stored.encryptedContent })
-                await openpgp.decrypt({
-                    message,
-                    // NO decryption key provided - this MUST throw
-                    decryptionKeys: undefined as any,
-                })
+                // NO decryption key provided - this MUST throw
+                const optionsWithoutKey: openpgp.DecryptOptions = { message }
+                await openpgp.decrypt(optionsWithoutKey)
             }).rejects.toThrow()
         })
 

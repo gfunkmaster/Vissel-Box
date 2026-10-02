@@ -3,12 +3,33 @@
 import { createClient } from '@/lib/supabase/server'
 import { auth } from '@clerk/nextjs/server'
 import { revalidatePath } from 'next/cache'
+import { headers } from 'next/headers'
 import type { Tenant } from '@/lib/supabase/types'
+import { checkRateLimit, getRateLimitIdentifier, tenantLookupLimiter } from '@/lib/security'
 
 /**
  * Get a tenant by their public slug (for anonymous users)
+ *
+ * Den publika uppslagsvägen är öppen för vem som helst och returnerar
+ * organisationsnamn och publik nyckel. Obegränsad går den att använda för att
+ * kartlägga vilka organisationer som kör Vissel-Box, så den är rate limitad per
+ * pseudonym klient (saltad IP-hash satt av middleware).
+ *
+ * OBS: funktionen anropas av både generateMetadata och själva sidan, alltså två
+ * uppslag per sidvisning. Gränsen är 30/minut.
  */
 export async function getTenantBySlug(slug: string): Promise<Tenant | null> {
+    const headersList = await headers()
+    const lookupLimit = await checkRateLimit(
+        tenantLookupLimiter,
+        getRateLimitIdentifier(headersList)
+    )
+
+    if (!lookupLimit.success) {
+        console.warn('Tenant lookup rate limit reached')
+        return null
+    }
+
     const supabase = await createClient()
 
     const { data, error } = await supabase

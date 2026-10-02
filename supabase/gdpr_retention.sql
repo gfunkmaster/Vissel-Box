@@ -8,9 +8,14 @@
 -- Swedish law recommends a maximum of 24 months (2 years) retention.
 -- 
 -- This script creates:
--- 1. A 'closed' status for completed investigations
--- 2. A 'closed_at' timestamp to track when reports were closed
--- 3. A pg_cron scheduled job for automatic hard deletion
+-- 1. The 'closed' status and 'closed_at' for completed investigations
+-- 2. A pg_cron scheduled job for automatic hard deletion
+-- 3. The gdpr_deletion_log audit table
+--
+-- ORDER: schema.sql already includes 'closed' and closed_at, so this script can
+-- be run before or after it. The ALTERs below are guarded (DROP IF EXISTS and an
+-- information_schema check), so they also work on a database created from the
+-- older schema.sql that only allowed 'new', 'read' and 'archived'.
 -- ============================================================================
 
 -- Step 1: Add 'closed' status and closed_at timestamp to reports table
